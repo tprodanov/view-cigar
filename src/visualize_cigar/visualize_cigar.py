@@ -311,15 +311,8 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
     out.write(painter(f'{aln.ref_name}:{aln.ref_start+1:,}-{aln.ref_start + ref_len:,}', Style.bold))
     out.write(' (bottom)\n')
 
-    max_end_length = len('{:,}'.format(max(aln.ref_start + ref_len, aln.query_start + query_len)))
-    left_margin = max_end_length - 1
-    margin = ' ' * left_margin
-    if left_margin > width + 10:
-        width = left_margin + 10
-        logging.warning(f'Width too small, expanding to {width}')
-    active_width = width - left_margin
     if not short_header:
-        print_cigar(split_cigar, out, painter, margin, active_width)
+        print_cigar(split_cigar, out, painter, '  ', width - 2)
 
     hl_equal = 'E' in highlight
     hl_mism = 'X' in highlight
@@ -330,19 +323,20 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
     last_qpos = abs(query_start) + 1
     last_rpos = ref_start
 
-    for i in range(0, len(pairs), active_width):
-        margin_q_offset, margin_r_offset = pairs[i]
-        margin_qpos = abs(query_start + margin_q_offset) + 1 if margin_q_offset is not None else last_qpos
-        margin_rpos = ref_start + margin_r_offset + 1 if margin_r_offset is not None else last_rpos
-        qpos_line = f'/{margin_qpos:>{max_end_length},}\n'
-        rpos_line = f'\{margin_rpos:>{max_end_length},}\n'
+    for i in range(0, len(pairs), width):
+        linestart_q_offset, linestart_r_offset = pairs[i]
+        linestart_qpos = abs(query_start + linestart_q_offset) + 1 if linestart_q_offset is not None else last_qpos
+        linestart_rpos = ref_start + linestart_r_offset + 1 if linestart_r_offset is not None else last_rpos
+        qpos_line = f'┌{linestart_qpos:,}'
+        rpos_line = f'└{linestart_rpos:,}'
         qdigit_line = painter.new_string()
         rdigit_line = painter.new_string()
         aln_line = painter.new_string()
         qletter_line = painter.new_string()
         rletter_line = painter.new_string()
+        line_offset = 0
 
-        for query_offset, ref_offset in pairs[i:i + active_width]:
+        for query_offset, ref_offset in pairs[i:i + width]:
             if query_offset is None:
                 qdigit_line += ' '
                 qletter = '-'
@@ -351,6 +345,10 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
                 digit = last_qpos % 10
                 qdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 qletter = query_seq[query_offset]
+                if last_qpos % 100 == 0 and len(qpos_line) + 1 < line_offset:
+                    qpos_comma = f'{last_qpos:,}'
+                    if line_offset + 1 + len(qpos_comma) < width:
+                        qpos_line += f'{" " * (line_offset - len(qpos_line))}┌{qpos_comma}'
 
             if ref_offset is None:
                 rdigit_line += ' '
@@ -360,6 +358,10 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
                 digit = last_rpos % 10
                 rdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 rletter = ref_seq[ref_offset]
+                if last_rpos % 100 == 0 and len(rpos_line) + 1 < line_offset:
+                    rpos_comma = f'{last_rpos:,}'
+                    if line_offset + 1 + len(rpos_comma) < width:
+                        rpos_line += f'{" " * (line_offset - len(rpos_line))}└{rpos_comma}'
 
             if query_offset is None or ref_offset is None:
                 op = '-' if hl_indels else ' '
@@ -371,15 +373,16 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
             aln_line.extend(op, OP_COLORS[op])
             qletter_line.extend(qletter, LETTER_COLORS.get(qletter, ''))
             rletter_line.extend(rletter, LETTER_COLORS.get(rletter, ''))
+            line_offset += 1
 
         out.write('\n')
-        out.write(qpos_line)
-        out.write(f'{margin}{qdigit_line}\n')
-        out.write(f'{margin}{qletter_line}\n')
-        out.write(f'{margin}{aln_line}\n')
-        out.write(f'{margin}{rletter_line}\n')
-        out.write(f'{margin}{rdigit_line}\n')
-        out.write(rpos_line)
+        out.write(f'{qpos_line}\n')
+        out.write(f'{qdigit_line}\n')
+        out.write(f'{qletter_line}\n')
+        out.write(f'{aln_line}\n')
+        out.write(f'{rletter_line}\n')
+        out.write(f'{rdigit_line}\n')
+        out.write(f'{rpos_line}\n')
 
 
 def main():
@@ -433,6 +436,10 @@ def main():
     args = parser.parse_args()
 
     logger = logging.basicConfig(format='%(levelname)-7s| %(message)s', level=logging.DEBUG)
+
+    if args.width < 20:
+        args.width = 20
+        logging.warning(f'Width too small, expanding to {args.width}')
 
     ref_seqs = load_sequences(args.ref_fa, args.ref_seq, 'reference')
     if args.sam is not None:
