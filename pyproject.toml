@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools >= 75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visualize-cigar"
+version = "0.0.1"
+dependencies = [
+    "pysam>=0.22",
+    "colored>=2.2",
+]
+requires-python = ">=3.10"
+authors = [
+  {name = "Timofey Prodanov"},
+]
+maintainers = [
+  {name = "Timofey Prodanov"},
+]
+description = "Easily visualize alignment"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["alignment", "cigar"]
+
+[project.urls]
+Repository = "https://github.com/tprodanov/visualize-cigar"
+"Bug Tracker" = "https://github.com/tprodanov/visualize-cigar/issues"
+
+[project.scripts]
+visualize-cigar = "visualize_cigar.visualize_cigar:main"
