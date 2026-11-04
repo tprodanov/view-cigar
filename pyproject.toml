@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "visualize-cigar"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
     "pysam>=0.22",
     "colored>=2.2",

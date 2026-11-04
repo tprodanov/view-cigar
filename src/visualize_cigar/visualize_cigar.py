@@ -158,12 +158,15 @@ class PlainString:
 
 class Painter:
     def __init__(self, color_mode, stream):
-        if color_mode == 'always':
-            self.colored = True
-        elif color_mode == 'never':
-            self.colored = False
-        else:
-            self.colored = stream.isatty()
+        match color_mode.lower():
+            case 'always' | 'yes' | 'y':
+                self.colored = True
+            case 'never' | 'n':
+                self.colored = False
+            case 'auto':
+                self.colored = stream.isatty()
+            case _:
+                panic(f'Unsupported option --color {color_mode}')
 
     def __call__(self, text, *codes):
         if self.colored and codes:
@@ -229,7 +232,7 @@ def load_sequences(filename, sequence, tag):
 
 OPERATION_REGEX = re.compile(r'([0-9]+)([MIDNSHP=X])')
 
-def process_cigar(cigar):
+def process_cigar(split_cigar):
     """
     Processes CIGAR and returns a list of pairs (query_pos, ref_pos),
     as well as the alignment query and reference lengths.
@@ -237,7 +240,7 @@ def process_cigar(cigar):
     ref_pos = 0
     query_pos = 0
     pairs = []
-    for length, operation in OPERATION_REGEX.findall(cigar):
+    for length, operation in split_cigar:
         length = int(length)
         match operation:
             case 'M' | '=' | 'X':
@@ -262,9 +265,29 @@ def process_cigar(cigar):
 
 
 LETTER_COLORS = { 'A': Fore.green, 'C': Fore.blue, 'G': Fore.yellow, 'T': Fore.red, '-': Fore.light_gray }
+OP_COLORS = { ' ': '', '|': '', 'X': Fore.red, '-': Fore.red }
 
 
-def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
+def print_cigar(split_cigar, out, painter, margin, active_width):
+    s = painter.new_string()
+    shift = 0
+    for length, op in split_cigar:
+        if shift == 0:
+            s += margin
+        elif shift + len(length) + len(op) >= active_width:
+            shift = 0
+            s += '\n' + margin
+        else:
+            shift += 1
+            s += ' '
+        s.extend(length, '')
+        s.extend(op, Fore.green if op == 'M' or op == '=' else Fore.red)
+        shift += len(length) + len(op)
+    s += '\n'
+    out.write(str(s))
+
+
+def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highlight, short_header):
     ref_seq = ref_seqs.fetch(aln.ref_name, aln.ref_start, aln.ref_end)
     query_seq = aln.query_seq if aln.query_seq is not None \
         else query_seqs.fetch(aln.query_name, aln.query_start, aln.query_end)
@@ -274,7 +297,8 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
     if not aln.query_strand:
         query_seq = reverse_complement(query_seq)
 
-    pairs, query_len, ref_len = process_cigar(aln.cigar)
+    split_cigar = OPERATION_REGEX.findall(aln.cigar)
+    pairs, query_len, ref_len = process_cigar(split_cigar)
     if len(ref_seq) != ref_len or len(query_seq) != query_len:
         logging.error(f'Alignment {aln.query_name} to {aln.ref_name}: incorrect alignment length: '
             f'reference {ref_len} (expected {len(ref_seq)}), query {query_len} (expected {len(query_seq)})')
@@ -286,7 +310,6 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
     out.write(' (top) to ')
     out.write(painter(f'{aln.ref_name}:{aln.ref_start+1:,}-{aln.ref_start + ref_len:,}', Style.bold))
     out.write(' (bottom)\n')
-    out.write(f'{aln.cigar}\n')
 
     max_end_length = len('{:,}'.format(max(aln.ref_start + ref_len, aln.query_start + query_len)))
     left_margin = max_end_length - 1
@@ -295,9 +318,13 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
         width = left_margin + 10
         logging.warning(f'Width too small, expanding to {width}')
     active_width = width - left_margin
+    if not short_header:
+        print_cigar(split_cigar, out, painter, margin, active_width)
 
-    lines = []
-    offset = 0
+    hl_equal = 'E' in highlight
+    hl_mism = 'X' in highlight
+    hl_indels = 'I' in highlight
+
     query_start = aln.query_start if aln.query_strand else -(aln.query_end - 1)
     ref_start = aln.ref_start
     last_qpos = abs(query_start) + 1
@@ -307,11 +334,11 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
         margin_q_offset, margin_r_offset = pairs[i]
         margin_qpos = abs(query_start + margin_q_offset) + 1 if margin_q_offset is not None else last_qpos
         margin_rpos = ref_start + margin_r_offset + 1 if margin_r_offset is not None else last_rpos
-        qpos_line = f'{margin_qpos:>{max_end_length},}\n'
-        rpos_line = f'{margin_rpos:>{max_end_length},}\n'
+        qpos_line = f'/{margin_qpos:>{max_end_length},}\n'
+        rpos_line = f'\{margin_rpos:>{max_end_length},}\n'
         qdigit_line = painter.new_string()
         rdigit_line = painter.new_string()
-        aln_line = ''
+        aln_line = painter.new_string()
         qletter_line = painter.new_string()
         rletter_line = painter.new_string()
 
@@ -334,7 +361,14 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
                 rdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 rletter = ref_seq[ref_offset]
 
-            aln_line += ' ' if qletter != rletter or query_offset is None else '|'
+            if query_offset is None or ref_offset is None:
+                op = '-' if hl_indels else ' '
+            elif qletter != rletter:
+                op = 'X' if hl_mism else ' '
+            else:
+                op = '|' if hl_equal else ' '
+
+            aln_line.extend(op, OP_COLORS[op])
             qletter_line.extend(qletter, LETTER_COLORS.get(qletter, ''))
             rletter_line.extend(rletter, LETTER_COLORS.get(rletter, ''))
 
@@ -359,7 +393,7 @@ def main():
     aln_args = parser.add_argument_group('Alignment')
     aln_group = aln_args.add_mutually_exclusive_group(required=True)
     aln_group.add_argument('-s', '--sam', metavar='FILE',
-        help='Input SAM/BAM file. Mutually exclusive with -p and -c.\n'
+        help='Input SAM/BAM/CRAM file. Mutually exclusive with -p and -c.\n'
             'Does not require query sequences (-Q/-q).')
     aln_group.add_argument('-p', '--paf', metavar='FILE',
         help='Input PAF file. Mutually exclusive with -s and -c.')
@@ -370,24 +404,27 @@ def main():
 
     seq_args = parser.add_argument_group('Sequences')
     seq_args.add_argument('-R', '--ref-fa', metavar='FILE',
-        help='Optionally indexed FASTA/Q file. Must contain reference sequences.')
+        help='Optionally indexed FASTA/Q file with reference sequences.')
     seq_args.add_argument('-Q', '--query-fa', metavar='FILE',
-        help='Optionally indexed FASTA/Q file. Must contain query sequences.\n'
-            'Equals to -R if -Q/-q are not provided.')
+        help='Optionally indexed FASTA/Q file with query sequences.\n'
+            'Defaults to -R if -Q/-q are not provided.')
     seq_args.add_argument('-r', '--ref-seq', metavar='STR',
-        help='Reference sequence. Mutually exclusive with -f, requires -q.')
+        help='Reference sequence. Mutually exclusive with -R.')
     seq_args.add_argument('-q', '--query-seq', metavar='STR',
-        help='Reference sequence. Mutually exclusive with -f, requires -r.')
+        help='Query sequence. Mutually exclusive with -Q.')
 
     opt_args = parser.add_argument_group('Optional arguments')
     opt_args.add_argument('-o', '--output', metavar='FILE', default='-',
         help='Output file [stdout].')
-    # opt_args.add_argument('-H', '--highlight', metavar='STR', default='=',
-    #     help='Highlight these operations between two sequences.')
+    opt_args.add_argument('-H', '--highlight', metavar='STR', default='E',
+        help='Highlight these operations between two sequences [%(default)s], a string with the\n'
+            'following possible letters: E (equal nucleotides), X (mismatches), I (indels).')
     opt_args.add_argument('-w', '--width', metavar='INT', default=120, type=int,
         help='Display width [%(default)s].')
-    opt_args.add_argument('--color', metavar='WHEN', default='auto',
-        help='When to provide colored output (always/auto/never) [%(default)s].')
+    opt_args.add_argument('-C', '--color', metavar='STR', default='auto',
+        help='When to provide colored output (always|yes|y / auto / never|n) [%(default)s].')
+    opt_args.add_argument('-S', '--short-header', action='store_true',
+        help='Do not print CIGAR before alignment.')
     opt_args.add_argument('-h', '--help', action='help',
         help='Show this help message and exit.')
     opt_args.add_argument('-V', '--version', action='version',
@@ -410,7 +447,7 @@ def main():
     out = open(args.output, 'wt')
     painter = Painter(args.color, out)
     for aln in load_alignments(args):
-        visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width)
+        visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width, args.highlight, args.short_header)
 
 
 if __name__ == '__main__':
