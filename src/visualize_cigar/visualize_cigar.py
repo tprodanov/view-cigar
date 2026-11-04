@@ -4,9 +4,18 @@ from collections import namedtuple
 import sys
 import builtins
 import re
+import os.path
 import logging
 import pysam
 from colored import Fore, Back, Style
+
+
+try:
+    from pysam import reverse_complement
+except ImportError:
+    REV_COMP_NT = { 'A': 'T', 'C': 'G', 'G': 'C', 'T': 'A' }
+    def reverse_complement(seq):
+        return ''.join(REV_COMP_NT.get(nt, 'N') for nt in seq[::-1])
 
 
 def panic(message):
@@ -30,6 +39,36 @@ Alignment = namedtuple('Alignment',
     'cigar', 'query_seq'])
 
 
+def load_sam(filename, ref_fasta):
+    with pysam.AlignmentFile(filename, require_index=False,
+            reference_filename=ref_fasta if filename.endswith('.cram') else None) as sam:
+        last_name = None
+        last_re = None
+        last_seq = None
+        last_strand = True
+        for record in sam:
+            name = record.query_name
+            read_end = record.is_read1
+            strand = record.is_forward
+            cigar = record.cigarstring
+
+            seq = record.query_sequence
+            if seq is not None and 'H' not in cigar:
+                last_name = name
+                last_re = read_end
+                last_strand = strand
+                last_seq = seq
+            else:
+                if name != last_name or last_re != read_end:
+                    logging.debug(f'Cannot identify sequence for read {name}, skipping')
+                    continue
+                seq = last_seq if strand == last_strand else reverse_complement(last_seq)
+                cigar = cigar.replace('H', 'S')
+            # Set strand to True because we already reverse-complemented sequence, if needed.
+            yield Alignment(record.reference_name, record.reference_start, record.reference_end,
+                name, 0, len(seq), True, cigar, seq)
+
+
 def load_paf(f):
     for line in f:
         if line.startswith('#') or line.startswith('@'):
@@ -49,6 +88,8 @@ def load_paf(f):
                 break
         if cigar is None:
             logging.warn(f'No CIGAR found for {query_name} and {ref_name}, skipping')
+        elif 'H' in cigar:
+            logging.error('Hard clipping in CIGAR is only allowed for SAM files, skipping')
         else:
             yield Alignment(ref_name, ref_start, ref_end, query_name, query_start, query_end, query_strand, cigar, None)
 
@@ -57,15 +98,16 @@ def load_alignments(args):
     assert args.cigar is not None or args.paf is not None or args.sam is not None
     if args.cigar is not None:
         if 'H' in args.cigar:
-            panic('Hard clipping in CIGAR is only allowed for SAM files')
-        yield Alignment('Reference', 0, None, 'Query', 0, None, True, args.cigar, None)
+            logging.error('Hard clipping in CIGAR is only allowed for SAM files, skipping')
+        else:
+            yield Alignment('Reference', 0, None, 'Query', 0, None, True, args.cigar, None)
 
     elif args.paf is not None:
         with open(args.paf, 'rt') as f:
             yield from load_paf(f)
 
     elif args.sam is not None:
-        raise NotImplementedError()
+        yield from load_sam(args.sam, args.ref_fa)
 
 
 class ColoredString:
@@ -170,13 +212,16 @@ def load_sequences(filename, sequence, tag):
         res.sequence = sequence.upper()
         return res
 
-    try:
-        fasta = pysam.FastaFile(filename)
-        res.indexed_fasta = fasta
-    except ValueError:
-        # No index found.
+    if os.path.exists(filename + '.fai'):
+        try:
+            fasta = pysam.FastaFile(filename)
+            res.indexed_fasta = fasta
+        except (ValueError, OSError) as e:
+            pass
+
+    if res.indexed_fasta is None:
         res.sequences = {}
-        with pysam.FastxFile(filename) in fastx:
+        with pysam.FastxFile(filename) as fastx:
             for record in fastx:
                 res.sequences[record.name] = record.sequence.upper()
     return res
@@ -200,8 +245,7 @@ def process_cigar(cigar):
                     pairs.append((query_pos + i, ref_pos + i))
                 ref_pos += length
                 query_pos += length
-            case 'I' | 'S' | 'H':
-                # Put hard padding here because we will replace cropped read sequence with full sequence
+            case 'I' | 'S':
                 for i in range(length):
                     pairs.append((query_pos + i, None))
                 query_pos += length
@@ -212,6 +256,8 @@ def process_cigar(cigar):
             case 'P':
                 for i in range(length):
                     pairs.append((None, None))
+            case 'H':
+                logging.error('Hard clipping may not be fully supported')
     return pairs, query_pos, ref_pos
 
 
@@ -226,7 +272,7 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
         out.write(painter(f'\n\n!!! Unavailable sequences "{aln.query_name}" and "{aln.ref_name}" !!!\n\n', Fore.red))
         return
     if not aln.query_strand:
-        query_seq = pysam.reverse_complement(query_seq)
+        query_seq = reverse_complement(query_seq)
 
     pairs, query_len, ref_len = process_cigar(aln.cigar)
     if len(ref_seq) != ref_len or len(query_seq) != query_len:
@@ -240,6 +286,7 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
     out.write(' (top) to ')
     out.write(painter(f'{aln.ref_name}:{aln.ref_start+1:,}-{aln.ref_start + ref_len:,}', Style.bold))
     out.write(' (bottom)\n')
+    out.write(f'{aln.cigar}\n')
 
     max_end_length = len('{:,}'.format(max(aln.ref_start + ref_len, aln.query_start + query_len)))
     left_margin = max_end_length - 1
@@ -335,6 +382,8 @@ def main():
     opt_args = parser.add_argument_group('Optional arguments')
     opt_args.add_argument('-o', '--output', metavar='FILE', default='-',
         help='Output file [stdout].')
+    # opt_args.add_argument('-H', '--highlight', metavar='STR', default='=',
+    #     help='Highlight these operations between two sequences.')
     opt_args.add_argument('-w', '--width', metavar='INT', default=120, type=int,
         help='Display width [%(default)s].')
     opt_args.add_argument('--color', metavar='WHEN', default='auto',
