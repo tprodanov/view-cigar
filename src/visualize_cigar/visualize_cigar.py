@@ -2,6 +2,7 @@
 
 from collections import namedtuple
 import sys
+import builtins
 import re
 import logging
 import pysam
@@ -13,10 +14,43 @@ def panic(message):
     exit(1)
 
 
+def open(filename, mode):
+    if filename == '-':
+        return sys.stdin if 'r' in mode else sys.stdout
+    elif filename.endswith('.gz'):
+        return gzip.open(filename, mode)
+    elif filename.endswith('.xz'):
+        return lzma.open(filename, mode)
+    return builtins.open(filename, mode)
+
+
 Alignment = namedtuple('Alignment',
     ['ref_name', 'ref_start', 'ref_end',
     'query_name', 'query_start', 'query_end', 'query_strand',
     'cigar', 'query_seq'])
+
+
+def load_paf(f):
+    for line in f:
+        if line.startswith('#') or line.startswith('@'):
+            continue
+        parts = line.strip().split('\t')
+        query_name = parts[0]
+        query_start = int(parts[2])
+        query_end = int(parts[3])
+        query_strand = parts[4] == '+'
+        ref_name = parts[5]
+        ref_start = int(parts[7])
+        ref_end = int(parts[8])
+        cigar = None
+        for entry in parts[12:]:
+            if entry.startswith('cg:Z:'):
+                cigar = entry[5:]
+                break
+        if cigar is None:
+            logging.warn(f'No CIGAR found for {query_name} and {ref_name}, skipping')
+        else:
+            yield Alignment(ref_name, ref_start, ref_end, query_name, query_start, query_end, query_strand, cigar, None)
 
 
 def load_alignments(args):
@@ -25,12 +59,13 @@ def load_alignments(args):
         if 'H' in args.cigar:
             panic('Hard clipping in CIGAR is only allowed for SAM files')
         yield Alignment('Reference', 0, None, 'Query', 0, None, True, args.cigar, None)
+
     elif args.paf is not None:
-        if 'H' in args.cigar:
-            panic('Hard clipping in CIGAR is only allowed for SAM files')
-        raise NotImplemented()
+        with open(args.paf, 'rt') as f:
+            yield from load_paf(f)
+
     elif args.sam is not None:
-        raise NotImplemented()
+        raise NotImplementedError()
 
 
 class ColoredString:
@@ -105,7 +140,12 @@ class Sequences:
 
     def fetch(self, name, start, end):
         if self.indexed_fasta is not None:
-            raise NotImplemented()
+            try:
+                return self.indexed_fasta.fetch(name, start, end).upper()
+            except (IndexError, ValueError) as e:
+                logging.error(f'Cannot fetch {name}:{start+1}-{end} (sequence not found or incorrect coordinates)')
+                return None
+
         seq = self.sequence if self.sequence else self.sequences.get(name)
         if seq is None:
             logging.error(f'Cannot find sequence {name}')
@@ -127,20 +167,19 @@ def load_sequences(filename, sequence, tag):
 
     res = Sequences()
     if sequence is not None:
-        res.sequence = sequence
-    else:
-        raise NotImplemented()
+        res.sequence = sequence.upper()
+        return res
+
+    try:
+        fasta = pysam.FastaFile(filename)
+        res.indexed_fasta = fasta
+    except ValueError:
+        # No index found.
+        res.sequences = {}
+        with pysam.FastxFile(filename) in fastx:
+            for record in fastx:
+                res.sequences[record.name] = record.sequence.upper()
     return res
-
-
-def open_output(filename):
-    if filename == '-':
-        return sys.stdout
-    elif filename.endswith('.gz'):
-        return gzip.open(filename, 'wt')
-    elif filename.endswith('.xz'):
-        return lzma.open(filename, 'wt')
-    return open(filename, 'wt')
 
 
 OPERATION_REGEX = re.compile(r'([0-9]+)([MIDNSHP=X])')
@@ -214,9 +253,15 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
     offset = 0
     query_start = aln.query_start if aln.query_strand else -(aln.query_end - 1)
     ref_start = aln.ref_start
+    last_qpos = abs(query_start) + 1
+    last_rpos = ref_start
+
     for i in range(0, len(pairs), active_width):
-        qpos_line = f'{abs(query_start + pairs[i][0]) + 1:>{max_end_length},}\n'
-        rpos_line = f'{ref_start + pairs[i][1] + 1:>{max_end_length},}\n'
+        margin_q_offset, margin_r_offset = pairs[i]
+        margin_qpos = abs(query_start + margin_q_offset) + 1 if margin_q_offset is not None else last_qpos
+        margin_rpos = ref_start + margin_r_offset + 1 if margin_r_offset is not None else last_rpos
+        qpos_line = f'{margin_qpos:>{max_end_length},}\n'
+        rpos_line = f'{margin_rpos:>{max_end_length},}\n'
         qdigit_line = painter.new_string()
         rdigit_line = painter.new_string()
         aln_line = ''
@@ -228,17 +273,19 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width):
                 qdigit_line += ' '
                 qletter = '-'
             else:
-                digit = (abs(query_start + query_offset) + 1) % 10
+                last_qpos = abs(query_start + query_offset) + 1
+                digit = last_qpos % 10
                 qdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
-                qletter = query_seq[query_offset].upper()
+                qletter = query_seq[query_offset]
 
             if ref_offset is None:
                 rdigit_line += ' '
                 rletter = '-'
             else:
-                digit = (ref_start + ref_offset + 1) % 10
+                last_rpos = ref_start + ref_offset + 1
+                digit = last_rpos % 10
                 rdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
-                rletter = ref_seq[ref_offset].upper()
+                rletter = ref_seq[ref_offset]
 
             aln_line += ' ' if qletter != rletter or query_offset is None else '|'
             qletter_line.extend(qletter, LETTER_COLORS.get(qletter, ''))
@@ -311,7 +358,7 @@ def main():
     else:
         panic('At least one of -R/-Q/-q arguments must be provided.')
 
-    out = open_output(args.output)
+    out = open(args.output, 'wt')
     painter = Painter(args.color, out)
     for aln in load_alignments(args):
         visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width)
