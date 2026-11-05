@@ -4,7 +4,10 @@ from collections import namedtuple
 import sys
 import builtins
 import re
-import os.path
+import os, os.path
+import contextlib
+import shutil
+import subprocess
 import logging
 import pysam
 from colored import Fore, Back, Style
@@ -18,14 +21,36 @@ except ImportError:
         return ''.join(REV_COMP_NT.get(nt, 'N') for nt in seq[::-1])
 
 
+@contextlib.contextmanager
+def paginator(enabled):
+    cmd = ['less', '-SRFX']
+    """Yield a file-like object that is piped through a pager if enabled."""
+    if not enabled or not sys.stdout.isatty() or shutil.which(cmd[0]) is None:
+        yield sys.stdout
+        return
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+    try:
+        proc.stdin.isatty = lambda: True
+        yield proc.stdin
+    except (BrokenPipeError, KeyboardInterrupt) as e:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait()
+
+
 def panic(message):
     logging.critical(message)
     exit(1)
 
 
-def open(filename, mode):
+def open(filename, mode, paginate=False):
     if filename == '-':
-        return sys.stdin if 'r' in mode else sys.stdout
+        return sys.stdin if 'r' in mode else paginator(paginate)
     elif filename.endswith('.gz'):
         return gzip.open(filename, mode)
     elif filename.endswith('.xz'):
@@ -416,11 +441,11 @@ def main():
 
     opt_args = parser.add_argument_group('Optional arguments')
     opt_args.add_argument('-o', '--output', metavar='FILE', default='-',
-        help='Output file [stdout].')
+        help='Output file [stdout]. Unless piped, stdout is automatically paginated.')
     opt_args.add_argument('-H', '--highlight', metavar='STR', default='EX',
         help='Highlight these operations between two sequences [%(default)s], a string with the\n'
             'following possible letters: E (equal nucleotides), X (mismatches), I (indels).')
-    opt_args.add_argument('-w', '--width', metavar='INT', default=120, type=int,
+    opt_args.add_argument('-w', '--width', metavar='INT', default='auto',
         help='Display width [%(default)s].')
     opt_args.add_argument('-C', '--color', metavar='STR', default='auto',
         help='When to provide colored output (always|yes|y / auto / never|n) [%(default)s].')
@@ -435,10 +460,6 @@ def main():
 
     logger = logging.basicConfig(format='%(levelname)-7s| %(message)s', level=logging.DEBUG)
 
-    if args.width < 20:
-        args.width = 20
-        logging.warning(f'Width too small, expanding to {args.width}')
-
     ref_seqs = load_sequences(args.ref_fa, args.ref_seq, 'reference')
     if args.sam is not None:
         query_seqs = None
@@ -449,11 +470,22 @@ def main():
     else:
         panic('At least one of -R/-Q/-q arguments must be provided.')
 
-    out = open(args.output, 'wt')
-    painter = Painter(args.color, out)
-    for aln in load_alignments(args):
-        visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width, args.highlight, args.short_header)
+    with open(args.output, 'wt', True) as out:
+        if args.width == 'auto':
+            args.width = os.get_terminal_size()[0] - 5 if out.isatty() else 120
+        else:
+            args.width = int(args.width)
+        if args.width < 20:
+            args.width = 20
+            logging.warning(f'Width too small, expanding to {args.width}')
+
+        painter = Painter(args.color, out)
+        for aln in load_alignments(args):
+            visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width, args.highlight, args.short_header)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt) as e:
+        pass
