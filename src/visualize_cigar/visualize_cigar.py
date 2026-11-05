@@ -334,9 +334,8 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
         aln_line = painter.new_string()
         qletter_line = painter.new_string()
         rletter_line = painter.new_string()
-        line_offset = 0
 
-        for query_offset, ref_offset in pairs[i:i + width]:
+        for j, (query_offset, ref_offset) in enumerate(pairs[i:i + width]):
             if query_offset is None:
                 qdigit_line += ' '
                 qletter = '-'
@@ -345,10 +344,10 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
                 digit = last_qpos % 10
                 qdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 qletter = query_seq[query_offset]
-                if last_qpos % 100 == 0 and len(qpos_line) + 1 < line_offset:
+                if last_qpos % 50 == 0 and len(qpos_line) + 1 < j:
                     qpos_comma = f'{last_qpos:,}'
-                    if line_offset + 1 + len(qpos_comma) < width:
-                        qpos_line += f'{" " * (line_offset - len(qpos_line))}┌{qpos_comma}'
+                    if j + 1 + len(qpos_comma) < width:
+                        qpos_line += f'{" " * (j - len(qpos_line))}┌{qpos_comma}'
 
             if ref_offset is None:
                 rdigit_line += ' '
@@ -358,10 +357,10 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
                 digit = last_rpos % 10
                 rdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 rletter = ref_seq[ref_offset]
-                if last_rpos % 100 == 0 and len(rpos_line) + 1 < line_offset:
+                if last_rpos % 50 == 0 and len(rpos_line) + 1 < j:
                     rpos_comma = f'{last_rpos:,}'
-                    if line_offset + 1 + len(rpos_comma) < width:
-                        rpos_line += f'{" " * (line_offset - len(rpos_line))}└{rpos_comma}'
+                    if j + 1 + len(rpos_comma) < width:
+                        rpos_line += f'{" " * (j - len(rpos_line))}└{rpos_comma}'
 
             if query_offset is None or ref_offset is None:
                 op = '-' if hl_indels else ' '
@@ -373,7 +372,6 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
             aln_line.extend(op, OP_COLORS[op])
             qletter_line.extend(qletter, LETTER_COLORS.get(qletter, ''))
             rletter_line.extend(rletter, LETTER_COLORS.get(rletter, ''))
-            line_offset += 1
 
         out.write('\n')
         out.write(f'{qpos_line}\n')
@@ -419,7 +417,7 @@ def main():
     opt_args = parser.add_argument_group('Optional arguments')
     opt_args.add_argument('-o', '--output', metavar='FILE', default='-',
         help='Output file [stdout].')
-    opt_args.add_argument('-H', '--highlight', metavar='STR', default='E',
+    opt_args.add_argument('-H', '--highlight', metavar='STR', default='EX',
         help='Highlight these operations between two sequences [%(default)s], a string with the\n'
             'following possible letters: E (equal nucleotides), X (mismatches), I (indels).')
     opt_args.add_argument('-w', '--width', metavar='INT', default=120, type=int,
