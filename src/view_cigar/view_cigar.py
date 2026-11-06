@@ -58,10 +58,43 @@ def open(filename, mode, paginate=False):
     return builtins.open(filename, mode)
 
 
-Alignment = namedtuple('Alignment',
-    ['ref_name', 'ref_start', 'ref_end',
-    'query_name', 'query_start', 'query_end', 'query_strand',
-    'cigar', 'query_seq'])
+class Interval:
+    def __init__(self, name, start, end):
+        self.name = name
+        self.start = start
+        self.end = end
+
+    @classmethod
+    def parse(cls, s):
+        name, coords = s.split(':')
+        start, end = map(int, coords.split('-'))
+        return cls(name, start - 1, end)
+
+
+class Alignment(namedtuple('Alignment', ['ref_interval', 'query_interval', 'query_strand', 'cigar', 'query_seq'])):
+    @property
+    def ref_name(self):
+        return self.ref_interval.name
+
+    @property
+    def ref_start(self):
+        return self.ref_interval.start
+
+    @property
+    def ref_end(self):
+        return self.ref_interval.end
+
+    @property
+    def query_name(self):
+        return self.query_interval.name
+
+    @property
+    def query_start(self):
+        return self.query_interval.start
+
+    @property
+    def query_end(self):
+        return self.query_interval.end
 
 
 def load_sam(filename, ref_fasta):
@@ -90,8 +123,9 @@ def load_sam(filename, ref_fasta):
                 seq = last_seq if strand == last_strand else reverse_complement(last_seq)
                 cigar = cigar.replace('H', 'S')
             # Set strand to True because we already reverse-complemented sequence, if needed.
-            yield Alignment(record.reference_name, record.reference_start, record.reference_end,
-                name, 0, len(seq), True, cigar, seq)
+            yield Alignment(
+                Interval(record.reference_name, record.reference_start, record.reference_end),
+                Interval(name, 0, len(seq)), True, cigar, seq)
 
 
 def load_paf(f):
@@ -116,16 +150,28 @@ def load_paf(f):
         elif 'H' in cigar:
             logging.error('Hard clipping in CIGAR is only allowed for SAM files, skipping')
         else:
-            yield Alignment(ref_name, ref_start, ref_end, query_name, query_start, query_end, query_strand, cigar, None)
+            yield Alignment(
+                Interval(ref_name, ref_start, ref_end),
+                Interval(query_name, query_start, query_end),
+                query_strand, cigar, None)
 
 
-def load_alignments(args):
+def load_alignments(args, force_ref_region, force_query_region, force_query_strand):
     assert args.cigar is not None or args.paf is not None or args.sam is not None
     if args.cigar is not None:
         if 'H' in args.cigar:
             logging.error('Hard clipping in CIGAR is only allowed for SAM files, skipping')
         else:
-            yield Alignment('Reference', 0, None, 'Query', 0, None, True, args.cigar, None)
+            if force_ref_region:
+                ref_interval = force_ref_region
+            else:
+                ref_interval = Interval('Reference', 0, None)
+            if force_query_region:
+                query_interval = force_query_region
+            else:
+                query_interval = Interval('Query', 0, None)
+            query_strand = True if force_query_strand is None else force_query_strand
+            yield Alignment(ref_interval, query_interval, query_strand, args.cigar, None)
 
     elif args.paf is not None:
         with open(args.paf, 'rt') as f:
@@ -425,8 +471,7 @@ def main():
         help='Input PAF file. Mutually exclusive with -s and -c.')
     aln_group.add_argument('-c', '--cigar', metavar='STR',
         help='Cigar string. Mutually exclusive with -s and -p.\n'
-            'Must match reference and query sequences from start to end\n'
-            'on a positive strand.')
+            'Region definitions can be provided with -r/-q.')
 
     seq_args = parser.add_argument_group('Sequences')
     seq_args.add_argument('-R', '--ref-fa', metavar='FILE',
@@ -435,9 +480,9 @@ def main():
         help='Optionally indexed FASTA/Q file with query sequences.\n'
             'Defaults to -R if -Q/-q are not provided.')
     seq_args.add_argument('-r', '--ref-seq', metavar='STR',
-        help='Reference sequence. Mutually exclusive with -R.')
+        help='Reference sequence or coordinates (name:start-end, requires -R).')
     seq_args.add_argument('-q', '--query-seq', metavar='STR',
-        help='Query sequence. Mutually exclusive with -Q.')
+        help='Query sequence or coordinates (name:start-end[:+/-], requires -R or -Q).')
 
     opt_args = parser.add_argument_group('Optional arguments')
     opt_args.add_argument('-o', '--output', metavar='FILE', default='-',
@@ -460,6 +505,27 @@ def main():
 
     logger = logging.basicConfig(format='%(levelname)-7s| %(message)s', level=logging.DEBUG)
 
+    force_ref_region = None
+    force_query_region = None
+    force_query_strand = None
+    if args.ref_seq is not None and ':' in args.ref_seq:
+        if args.ref_fa is None:
+            panic('Fasta -R required since -r contains coordinates')
+        if args.cigar is None:
+            panic('Coordinates in -r are supported only together with -c CIGAR')
+        force_ref_region = Interval.parse(args.ref_seq)
+        args.ref_seq = None
+    if args.query_seq is not None and ':' in args.query_seq:
+        if args.ref_fa is None and args.query_fa is None:
+            panic('Fasta -R/-Q required since -q contains coordinates')
+        if args.cigar is None:
+            panic('Coordinates in -q are supported only together with -c CIGAR')
+        if args.query_seq.endswith(':-') or args.query_seq.endswith(':+'):
+            force_query_strand = args.query_seq[-1] == '+'
+            args.query_seq = args.query_seq[:-2]
+        force_query_region = Interval.parse(args.query_seq)
+        args.query_seq = None
+
     ref_seqs = load_sequences(args.ref_fa, args.ref_seq, 'reference')
     if args.sam is not None:
         query_seqs = None
@@ -480,7 +546,7 @@ def main():
             logging.warning(f'Width too small, expanding to {args.width}')
 
         painter = Painter(args.color, out)
-        for aln in load_alignments(args):
+        for aln in load_alignments(args, force_ref_region, force_query_region, force_query_strand):
             visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width, args.highlight, args.short_header)
 
 
