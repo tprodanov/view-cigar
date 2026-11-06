@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from collections import namedtuple
+from collections import namedtuple, deque
 import sys
 import builtins
 import re
@@ -254,25 +254,39 @@ class Sequences:
         self.sequences = None
         self.sequence = None
 
-    def fetch(self, name, start, end):
+    def fetch(self, name, start, end, padding):
+        """
+        Tries to get name:start-end, optionally extending ends by at most `padding`.
+        Returns left_padding, right_padding, fetched_sequence.
+        """
         if self.indexed_fasta is not None:
             try:
-                return self.indexed_fasta.fetch(name, start, end).upper()
-            except (IndexError, ValueError) as e:
-                logging.error(f'Cannot fetch {name}:{start+1}-{end} (sequence not found or incorrect coordinates)')
+                seq_len = self.indexed_fasta.get_reference_length(name)
+            except KeyError:
+                logging.error(f'Cannot fetch {name}:{start+1}-{end} (sequence not found)')
                 return None
+            if seq_len < end:
+                logging.error(f'Sequence {name} is too short ({seq_len}), '
+                    f'asked for region {start+1}-{end})')
+                return None
+            left_padding = min(padding, start)
+            right_padding = min(padding, seq_len - end)
+            seq = self.indexed_fasta.fetch(name, start - left_padding, end + right_padding).upper()
+            return left_padding, right_padding, seq
 
         seq = self.sequence if self.sequence else self.sequences.get(name)
         if seq is None:
             logging.error(f'Cannot find sequence {name}')
             return None
         if end is None:
-            return seq
+            end = len(seq)
         if len(seq) < end:
             logging.error(f'Sequence {name} is too short ({len(seq)}, '
                 f'asked for region {start+1}-{end})')
             return None
-        return seq[start:end]
+        left_padding = min(padding, start)
+        right_padding = min(padding, len(seq) - end)
+        return left_padding, right_padding, seq[start - left_padding : end + right_padding]
 
 
 def load_sequences(filename, sequence, tag):
@@ -358,21 +372,35 @@ def print_cigar(split_cigar, out, painter, margin, active_width):
     out.write(str(s))
 
 
-def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highlight, short_header):
-    ref_seq = ref_seqs.fetch(aln.ref_name, aln.ref_start, aln.ref_end)
-    query_seq = aln.query_seq if aln.query_seq is not None \
-        else query_seqs.fetch(aln.query_name, aln.query_start, aln.query_end)
+def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, padding, width, highlight, short_header):
+    r_padd_left, r_padd_right, ref_seq = ref_seqs.fetch(aln.ref_name, aln.ref_start, aln.ref_end, padding)
+    q_padd_left, q_padd_right, query_seq = (0, 0, aln.query_seq) if aln.query_seq is not None \
+        else query_seqs.fetch(aln.query_name, aln.query_start, aln.query_end, padding)
     if ref_seq is None or query_seq is None:
         out.write(painter(f'\n\n!!! Unavailable sequences "{aln.query_name}" and "{aln.ref_name}" !!!\n\n', Fore.red))
         return
     if not aln.query_strand:
         query_seq = reverse_complement(query_seq)
+        q_padd_left, q_padd_right = q_padd_right, q_padd_left
 
     split_cigar = OPERATION_REGEX.findall(aln.cigar)
-    pairs, query_len, ref_len = process_cigar(split_cigar)
+    padded_cigar = deque(split_cigar)
+    if q_padd_left:
+        padded_cigar.appendleft((str(q_padd_left), 'I'))
+    if r_padd_left:
+        padded_cigar.appendleft((str(r_padd_left), 'D'))
+    if r_padd_right:
+        padded_cigar.append((str(r_padd_right), 'D'))
+    if q_padd_right:
+        padded_cigar.append((str(q_padd_right), 'I'))
+
+    pairs, query_len, ref_len = process_cigar(padded_cigar)
     if len(ref_seq) != ref_len or len(query_seq) != query_len:
+        sum_r_padd = r_padd_left + r_padd_right
+        sum_q_padd = q_padd_left + q_padd_right
         logging.error(f'Alignment {aln.query_name} to {aln.ref_name}: incorrect alignment length: '
-            f'reference {ref_len} (expected {len(ref_seq)}), query {query_len} (expected {len(query_seq)})')
+            f'reference {ref_len - sum_r_padd} (expected {len(ref_seq) - sum_r_padd}), '
+            f'query {query_len - sum_q_padd} (expected {len(query_seq) - sum_q_padd})')
         out.write(painter(f'\n\n!!! Incorrect alignment {aln.query_name} to {aln.ref_name} !!!\n\n', Fore.red))
         return
 
@@ -389,17 +417,12 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
     hl_mism = 'X' in highlight
     hl_indels = 'I' in highlight
 
-    query_start = aln.query_start if aln.query_strand else -(aln.query_end - 1)
-    ref_start = aln.ref_start
-    last_qpos = abs(query_start) + 1
-    last_rpos = ref_start
+    ref_start = aln.ref_start - r_padd_left
+    query_start = (aln.query_start if aln.query_strand else -(aln.query_end - 1)) - q_padd_left
 
     for i in range(0, len(pairs), width):
-        linestart_q_offset, linestart_r_offset = pairs[i]
-        linestart_qpos = abs(query_start + linestart_q_offset) + 1 if linestart_q_offset is not None else last_qpos
-        linestart_rpos = ref_start + linestart_r_offset + 1 if linestart_r_offset is not None else last_rpos
-        qpos_line = f'┌{linestart_qpos:,}'
-        rpos_line = f'└{linestart_rpos:,}'
+        qpos_line = ''
+        rpos_line = ''
         qdigit_line = painter.new_string()
         rdigit_line = painter.new_string()
         aln_line = painter.new_string()
@@ -411,12 +434,12 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
                 qdigit_line += ' '
                 qletter = '-'
             else:
-                last_qpos = abs(query_start + query_offset) + 1
-                digit = last_qpos % 10
+                qpos = abs(query_start + query_offset) + 1
+                digit = qpos % 10
                 qdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 qletter = query_seq[query_offset]
-                if last_qpos % 50 == 0 and len(qpos_line) + 1 < j:
-                    qpos_comma = f'{last_qpos:,}'
+                if (qpos == 1 or qpos % 50 == 0) and len(qpos_line) + 1 < j:
+                    qpos_comma = f'{qpos:,}'
                     if j + 1 + len(qpos_comma) < width:
                         qpos_line += f'{" " * (j - len(qpos_line))}┌{qpos_comma}'
 
@@ -424,12 +447,12 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, width, highligh
                 rdigit_line += ' '
                 rletter = '-'
             else:
-                last_rpos = ref_start + ref_offset + 1
-                digit = last_rpos % 10
+                rpos = ref_start + ref_offset + 1
+                digit = rpos % 10
                 rdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 rletter = ref_seq[ref_offset]
-                if last_rpos % 50 == 0 and len(rpos_line) + 1 < j:
-                    rpos_comma = f'{last_rpos:,}'
+                if (rpos == 1 or rpos % 50 == 0) and len(rpos_line) + 1 < j:
+                    rpos_comma = f'{rpos:,}'
                     if j + 1 + len(rpos_comma) < width:
                         rpos_line += f'{" " * (j - len(rpos_line))}└{rpos_comma}'
 
@@ -487,6 +510,8 @@ def main():
     opt_args = parser.add_argument_group('Optional arguments')
     opt_args.add_argument('-o', '--output', metavar='FILE', default='-',
         help='Output file [stdout]. Unless piped, stdout is automatically paginated.')
+    opt_args.add_argument('-P', '--padding', metavar='INT', type=int, default=0,
+        help='Add INT bp padding around the alignment region [%(default)s].')
     opt_args.add_argument('-H', '--highlight', metavar='STR', default='EX',
         help='Highlight these operations between two sequences [%(default)s], a string with the\n'
             'following possible letters: E (equal nucleotides), X (mismatches), I (indels).')
@@ -536,6 +561,8 @@ def main():
     else:
         panic('At least one of -R/-Q/-q arguments must be provided.')
 
+    args.padding = max(0, args.padding)
+
     with open(args.output, 'wt', True) as out:
         if args.width == 'auto':
             args.width = os.get_terminal_size()[0] - 5 if out.isatty() else 120
@@ -547,7 +574,8 @@ def main():
 
         painter = Painter(args.color, out)
         for aln in load_alignments(args, force_ref_region, force_query_region, force_query_strand):
-            visualize_alignment(aln, ref_seqs, query_seqs, out, painter, args.width, args.highlight, args.short_header)
+            visualize_alignment(aln, ref_seqs, query_seqs, out, painter,
+                args.padding, args.width, args.highlight, args.short_header)
 
 
 if __name__ == '__main__':
