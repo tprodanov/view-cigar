@@ -372,7 +372,8 @@ def print_cigar(split_cigar, out, painter, margin, active_width):
     out.write(str(s))
 
 
-def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, padding, width, highlight, short_header):
+def visualize_alignment(aln, ref_seqs, query_seqs, out,
+        painter, padding, width, not_aligned_string, highlight, short_header):
     r_padd_left, r_padd_right, ref_seq = ref_seqs.fetch(aln.ref_name, aln.ref_start, aln.ref_end, padding)
     q_padd_left, q_padd_right, query_seq = (0, 0, aln.query_seq) if aln.query_seq is not None \
         else query_seqs.fetch(aln.query_name, aln.query_start, aln.query_end, padding)
@@ -428,17 +429,20 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, padding, width,
         aln_line = painter.new_string()
         qletter_line = painter.new_string()
         rletter_line = painter.new_string()
+        q_moved = False
+        r_moved = False
 
         for j, (query_offset, ref_offset) in enumerate(pairs[i:i + width]):
             if query_offset is None:
                 qdigit_line += ' '
                 qletter = '-'
             else:
+                q_moved = True
                 qpos = abs(query_start + query_offset) + 1
                 digit = qpos % 10
                 qdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 qletter = query_seq[query_offset]
-                if (qpos == 1 or qpos % 50 == 0) and len(qpos_line) + 1 < j:
+                if (qpos == 1 or qpos % 20 == 0) and (not qpos_line or len(qpos_line) + 1 < j):
                     qpos_comma = f'{qpos:,}'
                     if j + 1 + len(qpos_comma) < width:
                         qpos_line += f'{" " * (j - len(qpos_line))}┌{qpos_comma}'
@@ -447,11 +451,12 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, padding, width,
                 rdigit_line += ' '
                 rletter = '-'
             else:
+                r_moved = True
                 rpos = ref_start + ref_offset + 1
                 digit = rpos % 10
                 rdigit_line.extend(digit, '' if digit == 0 else Fore.light_gray)
                 rletter = ref_seq[ref_offset]
-                if (rpos == 1 or rpos % 50 == 0) and len(rpos_line) + 1 < j:
+                if (rpos == 1 or rpos % 20 == 0) and (not rpos_line or len(rpos_line) + 1 < j):
                     rpos_comma = f'{rpos:,}'
                     if j + 1 + len(rpos_comma) < width:
                         rpos_line += f'{" " * (j - len(rpos_line))}└{rpos_comma}'
@@ -469,11 +474,11 @@ def visualize_alignment(aln, ref_seqs, query_seqs, out, painter, padding, width,
 
         out.write('\n')
         out.write(f'{qpos_line}\n')
-        out.write(f'{qdigit_line}\n')
+        out.write(f'{qdigit_line}\n' if q_moved else not_aligned_string)
         out.write(f'{qletter_line}\n')
         out.write(f'{aln_line}\n')
         out.write(f'{rletter_line}\n')
-        out.write(f'{rdigit_line}\n')
+        out.write(f'{rdigit_line}\n' if r_moved else not_aligned_string)
         out.write(f'{rpos_line}\n')
 
 
@@ -573,9 +578,10 @@ def main():
             logging.warning(f'Width too small, expanding to {args.width}')
 
         painter = Painter(args.color, out)
+        not_aligned_string = str(painter(' ' * ((args.width - 13) // 2) + '[NOT ALIGNED]\n', Fore.light_gray))
         for aln in load_alignments(args, force_ref_region, force_query_region, force_query_strand):
             visualize_alignment(aln, ref_seqs, query_seqs, out, painter,
-                args.padding, args.width, args.highlight, args.short_header)
+                args.padding, args.width, not_aligned_string, args.highlight, args.short_header)
 
 
 if __name__ == '__main__':
